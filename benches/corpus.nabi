@@ -1,0 +1,131 @@
+// Documents shaped like the usual JSON benchmark files, made the same
+// way on every run: `twitter` (API objects, strings with escapes and
+// non-ASCII text, large ids), `canada` (GeoJSON, coordinate pairs of
+// 15-17 digit floats) and `citm` (a catalog of small objects, short
+// integer arrays and many repeated keys).
+
+use core::bench::Bench;
+use core::hint::black_box;
+
+/// A xorshift generator: the same documents on every run and target.
+struct Rng { s: List<u64>; }
+
+impl Rng {
+    fn next(self) -> u64 {
+        let x = self.s[0];
+        x ^= x << 13u64;
+        x ^= x >> 7u64;
+        x ^= x << 17u64;
+        self.s[0] = x;
+        x
+    }
+    fn below(self, n: usize) -> usize { (self.next() % (n as u64)) as usize }
+}
+
+fn rng() -> Rng { Rng { s: [0x2545F4914F6CDD1Du64] } }
+
+const TEXTS: [str; 6] = [
+    "Just setting up my account \\ud83d\\ude00",
+    "RT @someone: a \\\"quoted\\\" line\\nand the next one",
+    "東京で会いましょう、明日の朝に。",
+    "Ça va très bien, merci beaucoup!",
+    "http:\\/\\/t.co\\/abcDEF123 check this out",
+    "plain ascii text of a typical length for a status update",
+];
+
+fn twitter() -> str {
+    let r = rng();
+    let b = StrBuf::new();
+    b.push_str("{\n  \"statuses\": [");
+    for i in 0..500 {
+        if i > 0 { b.push(','); }
+        let id = 505874900000000000u64 + r.next() % 1000000000u64;
+        b.push_str(f"\n    {{\n      \"created_at\": \"Sun Aug 31 00:29:{i % 60:02} +0000 2014\",\n      \"id\": {id},\n      \"id_str\": \"{id}\",\n");
+        b.push_str(f"      \"text\": \"{TEXTS[r.below(6)]}\",\n      \"truncated\": false,\n      \"in_reply_to_status_id\": null,\n");
+        b.push_str(f"      \"user\": {{\n        \"id\": {r.below(2000000000)},\n        \"name\": \"user {r.below(100000)}\",\n        \"screen_name\": \"u{r.below(100000)}\",\n");
+        b.push_str(f"        \"description\": \"{TEXTS[r.below(6)]}\",\n        \"followers_count\": {r.below(100000)},\n        \"verified\": {r.below(2) == 0},\n");
+        b.push_str("        \"profile_background_color\": \"C0DEED\",\n        \"entities\": { \"url\": { \"urls\": [] }, \"description\": { \"urls\": [] } }\n      },\n");
+        b.push_str(f"      \"retweet_count\": {r.below(5000)},\n      \"favorite_count\": {r.below(500)},\n      \"lang\": \"ja\",\n");
+        b.push_str(f"      \"metadata\": {{ \"result_type\": \"recent\", \"iso_language_code\": \"ja\" }},\n      \"score\": {r.below(100000)}.{r.below(1000)}\n    }}");
+    }
+    b.push_str("\n  ]\n}\n");
+    b.to_str()
+}
+
+fn canada() -> str {
+    let r = rng();
+    let b = StrBuf::new();
+    b.push_str("{\"type\":\"FeatureCollection\",\"features\":[{\"type\":\"Feature\",\"properties\":{\"name\":\"Canada\"},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[");
+    for ring in 0..40 {
+        if ring > 0 { b.push(','); }
+        b.push('[');
+        for k in 0..1000 {
+            if k > 0 { b.push(','); }
+            // the 15-17 significant digits of the real file
+            let lon = -140.0 + (r.next() % 8000000000000000u64) as f64 * 1e-14;
+            let lat = 42.0 + (r.next() % 4000000000000000u64) as f64 * 1e-14;
+            b.push_str(f"[{lon},{lat}]");
+        }
+        b.push(']');
+    }
+    b.push_str("]}}]}");
+    b.to_str()
+}
+
+fn citm() -> str {
+    let r = rng();
+    let b = StrBuf::new();
+    b.push_str("{\"areaNames\":{");
+    for i in 0..200 {
+        if i > 0 { b.push(','); }
+        b.push_str(f"\"{205705993 + i}\":\"Area {i}\"");
+    }
+    b.push_str("},\"events\":{");
+    for i in 0..1000 {
+        if i > 0 { b.push(','); }
+        let id = 138586341 + i;
+        b.push_str(f"\"{id}\":{{\"description\":null,\"id\":{id},\"logo\":\"/images/UE0AAAAACEKo6QAAAAZDSVRN\",\"name\":\"Event {i}\",");
+        b.push_str(f"\"subTopicIds\":[{337184269 + r.below(10)},{337184283 + r.below(10)}],\"subjectCode\":null,\"subtitle\":null,\"topicIds\":[{324846099 + r.below(10)},{107888604}]}}");
+    }
+    b.push_str("},\"performances\":[");
+    for i in 0..1500 {
+        if i > 0 { b.push(','); }
+        b.push_str(f"{{\"eventId\":{138586341 + r.below(1000)},\"id\":{339887544 + i},\"logo\":null,\"name\":null,\"prices\":[");
+        for k in 0..3 {
+            if k > 0 { b.push(','); }
+            b.push_str(f"{{\"amount\":{(r.below(80) + 10) * 1000},\"audienceSubCategoryId\":337100890,\"seatCategoryId\":{338937295 + k}}}");
+        }
+        b.push_str(f"],\"seatCategories\":[{{\"areas\":[{{\"areaId\":{205705993 + r.below(200)},\"blockIds\":[]}}],\"seatCategoryId\":338937295}}],\"seatMapImage\":null,\"start\":{1372701600000u64 + r.next() % 100000000u64},\"venueCode\":\"PLEYEL_PLEYEL\"}}");
+    }
+    b.push_str("]}");
+    b.to_str()
+}
+
+fn parse(b: Bench, s: str) {
+    b.set_bytes(s.len() as i64);
+    b.iter(|| try pkg::parse(black_box(s)) catch e { panic(f"{e}"); });
+}
+
+fn write(b: Bench, s: str) {
+    let v = try pkg::parse(s) catch e { panic(f"{e}"); };
+    b.set_bytes(v.to_str().len() as i64);
+    b.iter(|| black_box(v).to_str());
+}
+
+#[bench]
+fn parse_twitter(b: Bench) { parse(b, twitter()); }
+
+#[bench]
+fn parse_canada(b: Bench) { parse(b, canada()); }
+
+#[bench]
+fn parse_citm(b: Bench) { parse(b, citm()); }
+
+#[bench]
+fn write_twitter(b: Bench) { write(b, twitter()); }
+
+#[bench]
+fn write_canada(b: Bench) { write(b, canada()); }
+
+#[bench]
+fn write_citm(b: Bench) { write(b, citm()); }

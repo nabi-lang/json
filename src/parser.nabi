@@ -1,0 +1,370 @@
+//! A parser straight from text to `Value`, without events: the fast
+//! path of `parse`. It accepts exactly what `Tokenizer` accepts and
+//! builds the same `Value`; on any error it gives up (`none`) and
+//! `parse` reads the text again with the tokenizer for the message and
+//! position.
+
+use pkg::Value;
+use pkg::lemire::eisel_lemire;
+use pkg::read::MAX_DEPTH;
+
+const QUOTE: u8 = 0x22u8;
+const BSLASH: u8 = 0x5Cu8;
+
+/// Powers of ten a `f64` holds exactly.
+const POW10: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+
+struct Parser {
+    s: str;
+    i: usize;
+    /// Open containers.
+    d: usize;
+    bad: bool;
+}
+
+/// `s` as one document, or `none` when it is not valid JSON.
+pub(pkg) fn parse(s: str) -> Value | none {
+    let p = Parser { s: s, i: 0, d: 0, bad: false };
+    p.ws();
+    let v = p.value();
+    if p.bad { return none; }
+    p.ws();
+    if p.i != s.len() { return none; }
+    v
+}
+
+fn is_digit(b: u8) -> bool { b >= 0x30u8 && b <= 0x39u8 }
+
+fn hex_digit(b: u8) -> u32 {
+    if b >= 0x30u8 && b <= 0x39u8 { return (b - 0x30u8) as u32; }
+    if b >= 0x61u8 && b <= 0x66u8 { return (b - 0x57u8) as u32; }
+    if b >= 0x41u8 && b <= 0x46u8 { return (b - 0x37u8) as u32; }
+    0xFFFFFFFFu32
+}
+
+/// The first `"`, `\` or control byte in `b[at..]`, or `b.len()`.
+fn special(b: Slice<u8>, at: usize) -> usize {
+    let n = b.len();
+    if at >= n { return n; }
+    // a loop over a whole slice from 0 is the form the compiler vectorizes
+    let s = b[at:n];
+    let k = s.len();
+    let i = 0usize;
+    while i < k {
+        let c = s[i];
+        if (c == QUOTE) | (c == BSLASH) | (c < 0x20u8) { return at + i; }
+        i += 1;
+    }
+    n
+}
+
+impl Parser {
+    fn ws(ref self) {
+        let b = self.s.as_bytes();
+        let n = b.len();
+        let i = self.i;
+        // runs are short (`, `, a newline and an indent): a vectorized
+        // scan costs more than it saves
+        while i < n {
+            let c = b[i];
+            if c != 0x20u8 && c != 0x0Au8 && c != 0x0Du8 && c != 0x09u8 { break; }
+            i += 1;
+        }
+        self.i = i;
+    }
+
+    fn fail(ref self) -> Value {
+        self.bad = true;
+        Value::Null
+    }
+
+    fn value(ref self) -> Value {
+        let b = self.s.as_bytes();
+        let i = self.i;
+        if i >= b.len() { return self.fail(); }
+        let c = b[i];
+        if c == QUOTE {
+            let t = self.string();
+            return Value::Str(t);
+        }
+        if c == 0x7Bu8 { return self.object(); }
+        if c == 0x5Bu8 { return self.array(); }
+        if c == 0x2Du8 || is_digit(c) { return self.number(); }
+        if c == 0x74u8 { return if self.word("true") { Value::Bool(true) } else { self.fail() }; }
+        if c == 0x66u8 { return if self.word("false") { Value::Bool(false) } else { self.fail() }; }
+        if c == 0x6Eu8 { return if self.word("null") { Value::Null } else { self.fail() }; }
+        self.fail()
+    }
+
+    fn word(ref self, w: str) -> bool {
+        let n = w.len();
+        if self.i + n > self.s.len() { return false; }
+        if self.s[self.i:self.i + n] != w { return false; }
+        self.i += n;
+        true
+    }
+
+    /// Opens a container at `self.i`: false past the nesting limit.
+    fn open(ref self) -> bool {
+        if self.d >= MAX_DEPTH { return false; }
+        self.d += 1;
+        self.i += 1;
+        self.ws();
+        true
+    }
+
+    fn array(ref self) -> Value {
+        if !self.open() { return self.fail(); }
+        let xs: List<Value> = List::new();
+        let b = self.s.as_bytes();
+        if self.i < b.len() && b[self.i] == 0x5Du8 {
+            self.i += 1;
+            self.d -= 1;
+            return Value::Array(xs);
+        }
+        loop {
+            let v = self.value();
+            if self.bad { return Value::Null; }
+            xs.push(v);
+            self.ws();
+            if self.i >= b.len() { return self.fail(); }
+            let c = b[self.i];
+            self.i += 1;
+            if c == 0x2Cu8 {
+                self.ws();
+                continue;
+            }
+            if c == 0x5Du8 { break; }
+            return self.fail();
+        }
+        self.d -= 1;
+        Value::Array(xs)
+    }
+
+    fn object(ref self) -> Value {
+        if !self.open() { return self.fail(); }
+        let m: Dict<str, Value> = Dict::new();
+        let b = self.s.as_bytes();
+        if self.i < b.len() && b[self.i] == 0x7Du8 {
+            self.i += 1;
+            self.d -= 1;
+            return Value::Object(m);
+        }
+        loop {
+            if self.i >= b.len() || b[self.i] != QUOTE { return self.fail(); }
+            let k = self.string();
+            if self.bad { return Value::Null; }
+            self.ws();
+            if self.i >= b.len() || b[self.i] != 0x3Au8 { return self.fail(); }
+            self.i += 1;
+            self.ws();
+            let v = self.value();
+            if self.bad { return Value::Null; }
+            m.insert(k, v);
+            self.ws();
+            if self.i >= b.len() { return self.fail(); }
+            let c = b[self.i];
+            self.i += 1;
+            if c == 0x2Cu8 {
+                self.ws();
+                continue;
+            }
+            if c == 0x7Du8 { break; }
+            return self.fail();
+        }
+        self.d -= 1;
+        Value::Object(m)
+    }
+
+    /// The string whose `"` is at `self.i`; a slice of the input when it
+    /// has no escapes.
+    fn string(ref self) -> str {
+        let s = self.s;
+        let b = s.as_bytes();
+        let at = self.i + 1;
+        let j = special(b, at);
+        if j < b.len() && b[j] == QUOTE {
+            self.i = j + 1;
+            return s[at:j];
+        }
+        self.escaped(at, j)
+    }
+
+    /// The rest of a string from `j`, the first `\` or control byte;
+    /// `at` is just after the opening quote.
+    fn escaped(ref self, at: usize, j: usize) -> str {
+        let s = self.s;
+        let b = s.as_bytes();
+        let n = b.len();
+        let out = StrBuf::with_capacity(j - at + 16);
+        out.push_str(s[at:j]);
+        loop {
+            if j >= n {
+                self.bad = true;
+                return "";
+            }
+            let c = b[j];
+            if c == QUOTE { break; }
+            if c < 0x20u8 {
+                self.bad = true;
+                return "";
+            }
+            if c != BSLASH {
+                let k = special(b, j);
+                out.push_str(s[j:k]);
+                j = k;
+                continue;
+            }
+            if j + 1 >= n {
+                self.bad = true;
+                return "";
+            }
+            let e = b[j + 1];
+            if e == 0x75u8 {
+                let hi = self.hex4(j);
+                if hi >= 0xDC00u32 {
+                    // a lone low surrogate, or no 4 hex digits
+                    if hi <= 0xDFFFu32 || hi > 0xFFFFu32 {
+                        self.bad = true;
+                        return "";
+                    }
+                }
+                if hi >= 0xD800u32 && hi <= 0xDBFFu32 {
+                    if j + 7 >= n || b[j + 6] != BSLASH || b[j + 7] != 0x75u8 {
+                        self.bad = true;
+                        return "";
+                    }
+                    let lo = self.hex4(j + 6);
+                    if lo < 0xDC00u32 || lo > 0xDFFFu32 {
+                        self.bad = true;
+                        return "";
+                    }
+                    out.push(char::from_u32(0x10000u32 + ((hi - 0xD800u32) << 10u32) + (lo - 0xDC00u32)) ?? '\0');
+                    j += 12;
+                } else {
+                    out.push(char::from_u32(hi) ?? '\0');
+                    j += 6;
+                }
+                continue;
+            }
+            let ch = if e == QUOTE {
+                '"'
+            } else if e == BSLASH {
+                '\\'
+            } else if e == 0x2Fu8 {
+                '/'
+            } else if e == 0x62u8 {
+                '\x08'
+            } else if e == 0x66u8 {
+                '\x0C'
+            } else if e == 0x6Eu8 {
+                '\n'
+            } else if e == 0x72u8 {
+                '\r'
+            } else if e == 0x74u8 {
+                '\t'
+            } else {
+                self.bad = true;
+                return "";
+            };
+            out.push(ch);
+            j += 2;
+        }
+        self.i = j + 1;
+        out.to_str()
+    }
+
+    /// The 4 hex digits of the `\u` escape at `j`; past 0xFFFF when they
+    /// are not there.
+    fn hex4(self, j: usize) -> u32 {
+        let b = self.s.as_bytes();
+        if j + 6 > b.len() { return 0x10000u32; }
+        let v = 0u32;
+        for k in j + 2..j + 6 {
+            let d = hex_digit(b[k]);
+            if d > 15u32 { return 0x10000u32; }
+            v = v * 16u32 + d;
+        }
+        v
+    }
+
+    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
+    fn number(ref self) -> Value {
+        let s = self.s;
+        let b = s.as_bytes();
+        let n = b.len();
+        let at = self.i;
+        let neg = b[at] == 0x2Du8;
+        let int_start = if neg { at + 1 } else { at };
+        // the digits as a u64, exact up to 19 of them
+        let (j, m) = digits(b, int_start, 0u64);
+        if j == int_start { return self.fail(); }
+        if b[int_start] == 0x30u8 && j - int_start > 1 { return self.fail(); }
+        let nd = j - int_start;
+        let is_float = false;
+        let frac = 0i64;
+        if j < n && b[j] == 0x2Eu8 {
+            is_float = true;
+            let (k, m2) = digits(b, j + 1, m);
+            if k == j + 1 { return self.fail(); }
+            frac = (k - j - 1) as i64;
+            nd += k - j - 1;
+            m = m2;
+            j = k;
+        }
+        let exp = 0i64;
+        if j < n && (b[j] == 0x65u8 || b[j] == 0x45u8) {
+            is_float = true;
+            j += 1;
+            let eneg = false;
+            if j < n && (b[j] == 0x2Bu8 || b[j] == 0x2Du8) {
+                eneg = b[j] == 0x2Du8;
+                j += 1;
+            }
+            let (k, e) = digits(b, j, 0u64);
+            if k == j { return self.fail(); }
+            // past 19 digits the value is out of range or 0 anyway
+            exp = if k - j > 18 { 100000i64 } else { e.min(100000u64) as i64 };
+            if eneg { exp = -exp; }
+            j = k;
+        }
+        self.i = j;
+        if !is_float {
+            if j - int_start == 1 && neg && m == 0u64 { return Value::Float(-0.0); }
+            if j - int_start > 18 {
+                return Value::Int(try s[at:j].parse::<Int>() catch _ { return self.fail(); });
+            }
+            let v = m as i64;
+            return Value::Int(Int::from_i64(if neg { -v } else { v }));
+        }
+        if nd <= 19 {
+            let e10 = exp - frac;
+            if m == 0u64 { return Value::Float(if neg { -0.0 } else { 0.0 }); }
+            // exact digits and power of ten: one rounding
+            if m <= 9007199254740992u64 && e10 >= -22i64 && e10 <= 22i64 {
+                let x = m as f64;
+                x = if e10 >= 0i64 { x * POW10[e10 as usize] } else { x / POW10[(-e10) as usize] };
+                return Value::Float(if neg { -x } else { x });
+            }
+            if let bits: u64 = eisel_lemire(m, e10) {
+                let x = f64::from_bits(bits);
+                return Value::Float(if neg { -x } else { x });
+            }
+        }
+        Value::Float(try s[at:j].parse::<f64>() catch _ { return self.fail(); })
+    }
+}
+
+/// The decimal digits from `j`: where they end, and `m` with them
+/// appended (wrapping past 19 digits).
+fn digits(b: Slice<u8>, j: usize, m: u64) -> (usize, u64) {
+    let n = b.len();
+    let i = j;
+    while i < n {
+        let c = b[i];
+        if c < 0x30u8 || c > 0x39u8 { break; }
+        m = m.wrapping_mul(10u64).wrapping_add((c - 0x30u8) as u64);
+        i += 1;
+    }
+    (i, m)
+}

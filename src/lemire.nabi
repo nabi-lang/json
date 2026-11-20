@@ -1,0 +1,59 @@
+//! Decimal to `f64` by the Eisel-Lemire algorithm: the decimal
+//! significand times a 128-bit approximation of the power of ten,
+//! rounded once. It gives up on the few inputs where that cannot decide
+//! the rounding (and on subnormal and overflowing results), for the
+//! exact parser to take them.
+
+use pkg::powers::POW5;
+
+/// `a * b` as `(high, low)` 64-bit halves.
+#[inline(always)]
+fn full_mul(a: u64, b: u64) -> (u64, u64) {
+    let m = 0xFFFFFFFFu64;
+    let a0 = a & m;
+    let a1 = a >> 32u64;
+    let b0 = b & m;
+    let b1 = b >> 32u64;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = (p00 >> 32u64) + (p01 & m) + (p10 & m);
+    let lo = (mid << 32u64) | (p00 & m);
+    let hi = p11 + (p01 >> 32u64) + (p10 >> 32u64) + (mid >> 32u64);
+    (hi, lo)
+}
+
+/// The bits of the `f64` nearest `w * 10^q` (`w` exact, not 0), or
+/// `none` when this method cannot tell.
+pub(pkg) fn eisel_lemire(w: u64, q: i64) -> u64 | none {
+    if q < -342i64 || q > 308i64 { return none; }
+    let lz = w.leading_zeros() as u64;
+    let x = w << lz;
+    let idx = (2i64 * (q + 342i64)) as usize;
+    let (hi, lo) = full_mul(x, POW5[idx]);
+    if (hi & 0x1FFu64) == 0x1FFu64 {
+        let (hi2, _) = full_mul(x, POW5[idx + 1]);
+        let nlo = lo.wrapping_add(hi2);
+        if hi2 > nlo { hi += 1u64; }
+        lo = nlo;
+    }
+    if lo == 0xFFFFFFFFFFFFFFFFu64 && (q < -27i64 || q > 55i64) { return none; }
+    let upper = hi >> 63u64;
+    let mant = hi >> (upper + 9u64);
+    let power2 = (((152170i64 + 65536i64) * q) >> 16i64) + 63i64 + upper as i64 - lz as i64 + 1023i64;
+    if power2 <= 0i64 { return none; }
+    if lo <= 1u64 && q >= -4i64 && q <= 23i64 && (mant & 3u64) == 1u64 {
+        // exactly halfway: round to even
+        if (mant << (upper + 9u64)) == hi { mant &= !1u64; }
+    }
+    mant += mant & 1u64;
+    mant >>= 1u64;
+    if mant >= (2u64 << 52u64) {
+        mant = 1u64 << 52u64;
+        power2 += 1i64;
+    }
+    mant &= !(1u64 << 52u64);
+    if power2 >= 0x7FFi64 { return none; }
+    mant | ((power2 as u64) << 52u64)
+}

@@ -1,0 +1,154 @@
+//! JSON text of a `Value`: compact or indented.
+
+use pkg::Value;
+
+/// `v` into `out`; `indent` > 0 puts each member on its own line,
+/// `indent` spaces per level (`level` is the current one).
+pub fn value(out: StrBuf, v: Value, indent: usize, level: usize) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        Value::Int(n) => {
+            // i64 formatting is cheaper than `int`'s
+            if let v: i64 = n.to_i64() { out.push_str(f"{v}"); } else { out.push_str(f"{n}"); }
+        },
+        Value::Float(x) => decimal(out, x),
+        Value::Str(s) => string(out, s),
+        Value::Array(xs) => {
+            if xs.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            let first = true;
+            for x in xs {
+                if !first { out.push(','); }
+                first = false;
+                newline(out, indent, level + 1);
+                value(out, x, indent, level + 1);
+            }
+            newline(out, indent, level);
+            out.push(']');
+        },
+        Value::Object(m) => {
+            if m.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            let first = true;
+            for (k, x) in m {
+                if !first { out.push(','); }
+                first = false;
+                newline(out, indent, level + 1);
+                string(out, k);
+                out.push_str(if indent > 0 { ": " } else { ":" });
+                value(out, x, indent, level + 1);
+            }
+            newline(out, indent, level);
+            out.push('}');
+        },
+    }
+}
+
+const SPACES: str = "                                                                ";
+
+fn newline(out: StrBuf, indent: usize, level: usize) {
+    if indent == 0 { return; }
+    out.push('\n');
+    let n = indent * level;
+    while n > 0 {
+        let k = n.min(SPACES.len());
+        out.push_str(SPACES[:k]);
+        n -= k;
+    }
+}
+
+/// The first byte of `b[at..]` that a JSON string must escape, or
+/// `b.len()`.
+fn escape_at(b: Slice<u8>, at: usize) -> usize {
+    let n = b.len();
+    if at >= n { return n; }
+    if n - at < 32 {
+        // short (keys, most values): setting up the vector loop costs more
+        let i = at;
+        while i < n {
+            let c = b[i];
+            if c == 0x22u8 || c == 0x5Cu8 || c < 0x20u8 { return i; }
+            i += 1;
+        }
+        return n;
+    }
+    // a loop over a whole slice from 0 is the form the compiler vectorizes
+    let s = b[at:n];
+    let k = s.len();
+    let i = 0usize;
+    while i < k {
+        let c = s[i];
+        if (c == 0x22u8) | (c == 0x5Cu8) | (c < 0x20u8) { return at + i; }
+        i += 1;
+    }
+    n
+}
+
+/// `s` quoted: `"` `\` and control characters escaped, the rest as is.
+pub fn string(out: StrBuf, s: str) {
+    out.push('"');
+    let b = s.as_bytes();
+    let n = b.len();
+    let i = escape_at(b, 0);
+    if i == n {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
+    let from = 0usize;
+    while i < n {
+        out.push_str(s[from:i]);
+        let c = b[i];
+        if c == 0x22u8 {
+            out.push_str("\\\"");
+        } else if c == 0x5Cu8 {
+            out.push_str("\\\\");
+        } else if c == 0x0Au8 {
+            out.push_str("\\n");
+        } else if c == 0x0Du8 {
+            out.push_str("\\r");
+        } else if c == 0x09u8 {
+            out.push_str("\\t");
+        } else if c == 0x08u8 {
+            out.push_str("\\b");
+        } else if c == 0x0Cu8 {
+            out.push_str("\\f");
+        } else {
+            out.push_str("\\u00");
+            let hex = "0123456789abcdef";
+            unsafe {
+                out.push_byte(hex.byte((c >> 4u8) as usize));
+                out.push_byte(hex.byte((c & 15u8) as usize));
+            }
+        }
+        from = i + 1;
+        i = escape_at(b, from);
+    }
+    out.push_str(s[from:]);
+    out.push('"');
+}
+
+/// `float_text(x)` into `out`.
+fn decimal(out: StrBuf, x: f64) {
+    if !x.is_finite() { panic("NaN/infinity has no JSON form"); }
+    let a = x.abs();
+    let t = if a != 0.0 && (a < 1e-6 || a >= 1e21) { f"{x:e}" } else { f"{x}" };
+    out.push_str(t);
+    if !t.contains(".") && !t.contains("e") { out.push_str(".0"); }
+}
+
+/// The shortest digits that read back as `x`, with a `.0` or an exponent
+/// so it reads back as a float. NaN / infinity have no JSON form: a
+/// panic (check `is_finite` first when the data may hold them).
+pub fn float_text(x: f64) -> str {
+    let out = StrBuf::with_capacity(24);
+    decimal(out, x);
+    out.to_str()
+}
