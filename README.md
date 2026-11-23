@@ -38,7 +38,7 @@ the `line:col` error, so errors cost nothing on the happy path.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/json/latest/docs
+https://docs.nabi-lang.org/packages/json/latest
 
 ## License
 
